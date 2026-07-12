@@ -23,7 +23,7 @@ from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
-app = FastAPI(title="Copilot OpenAI-compatible API", version="1.2.0")
+app = FastAPI(title="Copilot OpenAI-compatible API", version="1.3.0")
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -45,11 +45,11 @@ def _check_auth(authorization: Optional[str]) -> bool:
 
     A key is valid if it matches:
     1. The bootstrap key from the API_KEY env var (if set), or
-    2. Any active key in the keystore file.
+    2. Any active key in the SQLite keystore.
     If neither API_KEY nor any keystore key exists, auth is disabled.
     """
     raw_key = _extract_bearer(authorization)
-    if not API_KEY and not keystore.list_keys():
+    if not API_KEY and not keystore.list_keys(active_only=True):
         return True  # auth disabled (no keys configured at all)
     return keystore.is_valid_key(raw_key, bootstrap_key=API_KEY)
 
@@ -92,6 +92,15 @@ def _not_found():
             "type": "invalid_request_error",
         }},
     )
+
+
+def _admin_gate(authorization: Optional[str]):
+    """Common guard for admin endpoints. Returns a response if access denied, None if allowed."""
+    if not ADMIN_KEY:
+        return _not_found()
+    if not _check_admin(authorization):
+        return _forbidden()
+    return None
 
 
 # Server runs headless and must never pop a visible browser mid-request. With
@@ -240,15 +249,15 @@ class CreateKeyRequest(BaseModel):
 @app.post("/admin/keys")
 def create_key(req: CreateKeyRequest, authorization: Optional[str] = Header(None)):
     """Generate a new API key. The full key is returned once; it is not retrievable later."""
-    if not _check_admin(authorization):
-        if not ADMIN_KEY:
-            return _not_found()
-        return _forbidden()
+    denied = _admin_gate(authorization)
+    if denied:
+        return denied
     record = keystore.generate_key(name=req.name)
     return {
         "id": record["id"],
         "key": record["key"],
         "name": record["name"],
+        "status": record["status"],
         "created_at": record["created_at"],
         "message": "Save this key now — it will not be shown in full again.",
     }
@@ -256,22 +265,23 @@ def create_key(req: CreateKeyRequest, authorization: Optional[str] = Header(None
 
 @app.get("/admin/keys")
 def list_keys(authorization: Optional[str] = Header(None)):
-    """List all API keys (masked). Revoked keys are included for audit."""
-    if not _check_admin(authorization):
-        if not ADMIN_KEY:
-            return _not_found()
-        return _forbidden()
-    keys = keystore.list_all_keys()
+    """List all API keys (masked). Includes status, usage stats, and timestamps."""
+    denied = _admin_gate(authorization)
+    if denied:
+        return denied
+    keys = keystore.list_keys(active_only=False)
     return {
         "count": len(keys),
         "keys": [
             {
                 "id": k["id"],
-                "name": k.get("name", ""),
+                "name": k["name"],
                 "key": keystore.mask_key(k["key"]),
-                "created_at": k.get("created_at"),
-                "revoked": k.get("revoked", False),
+                "status": k["status"],
+                "created_at": k["created_at"],
                 "revoked_at": k.get("revoked_at"),
+                "last_used_at": k.get("last_used_at"),
+                "usage_count": k.get("usage_count", 0),
             }
             for k in keys
         ],
@@ -279,13 +289,33 @@ def list_keys(authorization: Optional[str] = Header(None)):
     }
 
 
+@app.get("/admin/keys/{key_id}")
+def get_key(key_id: str, authorization: Optional[str] = Header(None)):
+    """Get details of a single key by its id (key value is masked)."""
+    denied = _admin_gate(authorization)
+    if denied:
+        return denied
+    k = keystore.get_key(key_id)
+    if not k:
+        return _not_found()
+    return {
+        "id": k["id"],
+        "name": k["name"],
+        "key": keystore.mask_key(k["key"]),
+        "status": k["status"],
+        "created_at": k["created_at"],
+        "revoked_at": k.get("revoked_at"),
+        "last_used_at": k.get("last_used_at"),
+        "usage_count": k.get("usage_count", 0),
+    }
+
+
 @app.delete("/admin/keys/{key_id}")
 def revoke_key(key_id: str, authorization: Optional[str] = Header(None)):
     """Revoke an API key by its id."""
-    if not _check_admin(authorization):
-        if not ADMIN_KEY:
-            return _not_found()
-        return _forbidden()
+    denied = _admin_gate(authorization)
+    if denied:
+        return denied
     revoked = keystore.revoke_key(key_id)
     if not revoked:
         return JSONResponse(
@@ -295,6 +325,15 @@ def revoke_key(key_id: str, authorization: Optional[str] = Header(None)):
     return {"message": f"Key '{key_id}' revoked successfully.", "id": key_id}
 
 
+@app.get("/admin/stats")
+def key_stats(authorization: Optional[str] = Header(None)):
+    """Return aggregate statistics about API keys."""
+    denied = _admin_gate(authorization)
+    if denied:
+        return denied
+    return keystore.key_stats()
+
+
 # ---------------------------------------------------------------------------
 # Root / health
 # ---------------------------------------------------------------------------
@@ -302,12 +341,12 @@ def revoke_key(key_id: str, authorization: Optional[str] = Header(None)):
 
 @app.get("/")
 def root():
-    has_keys = bool(API_KEY) or bool(keystore.list_keys())
+    has_keys = bool(API_KEY) or bool(keystore.list_keys(active_only=True))
     return {
         "service": "Copilot OpenAI-compatible API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "auth": "enabled" if has_keys else "disabled",
         "endpoints": ["/v1/models", "/v1/chat/completions"],
         "admin": "enabled" if ADMIN_KEY else "disabled",
-        "admin_endpoints": ["/admin/keys"] if ADMIN_KEY else [],
+        "admin_endpoints": ["/admin/keys", "/admin/keys/{id}", "/admin/stats"] if ADMIN_KEY else [],
     }
