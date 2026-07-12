@@ -5,6 +5,7 @@ driver: keeps a short-lived snapshot of cookies + MSAL access token on disk and
 transparently refreshes it from the persistent browser profile when it goes stale.
 """
 
+import base64
 import json
 import time
 from pathlib import Path
@@ -47,7 +48,7 @@ def load_auth(
     if p.exists():
         try:
             cached = json.loads(p.read_text(encoding="utf-8"))
-            if cached.get("access_token") and (time.time() - cached.get("saved_at", 0)) < max_age:
+            if cached.get("access_token") and _token_is_valid(cached, max_age):
                 return cached
         except (ValueError, OSError):
             pass  # corrupt/unreadable -> refresh below
@@ -84,3 +85,46 @@ def load_auth(
             "or sign in manually with `python -m copilot login`."
         )
     return auth
+
+
+def _jwt_exp(token: str) -> Optional[float]:
+    """Return the ``exp`` claim from a JWT, or ``None`` if it can't be parsed."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        # JWT uses base64url without padding; add padding for decode.
+        payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return float(payload.get("exp", 0)) or None
+    except Exception:
+        return None
+
+
+def _token_is_valid(cached: dict, max_age: int) -> bool:
+    """Check whether a cached auth entry is still usable.
+
+    For **enterprise** (Sydney protocol) tokens, the access token is a JWT
+    whose ``exp`` claim is the real expiry — we trust it directly and skip
+    the browser refresh, which is critical for headless/Docker deployments
+    where no browser is available.
+
+    For **consumer** tokens, we fall back to the ``saved_at`` + ``max_age``
+    heuristic (consumer tokens are not always JWTs with a readable ``exp``).
+    """
+    token = cached.get("access_token")
+    if not token:
+        return False
+
+    # Enterprise: check the JWT exp claim directly.
+    if cached.get("protocol") == "sydney":
+        exp = _jwt_exp(token)
+        if exp and exp > time.time() + 60:  # 60s safety margin
+            return True
+        # JWT expired or unreadable — can't refresh headlessly; let the caller
+        # try the browser path (which will also fail in Docker, but at least
+        # the error message is clearer than a stale-token 401).
+        return False
+
+    # Consumer: use the saved_at + max_age heuristic.
+    return (time.time() - cached.get("saved_at", 0)) < max_age
