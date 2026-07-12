@@ -1,0 +1,23 @@
+# Production deployment — uses the pre-built image from GHCR.
+# Copy .env from ../.env.example and adjust, then: docker compose up -d
+
+services:
+  copilot-api:
+    image: ghcr.io/kedaya2025/copilot-gate:latest
+    container_name: copilot-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      RATE_LIMIT_RPM: "12"
+      RATE_LIMIT_BURST: "4"
+    volumes:
+      - ./session:/app/session
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    external: true
