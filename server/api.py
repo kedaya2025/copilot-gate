@@ -6,11 +6,13 @@ from typing import Optional
 
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
-from .config import API_KEY, MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from .config import ADMIN_KEY, API_KEY, MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from . import keystore
 from .openai_format import (
     completion_response,
     new_id,
@@ -21,21 +23,43 @@ from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
-app = FastAPI(title="Copilot OpenAI-compatible API", version="1.1.0")
+app = FastAPI(title="Copilot OpenAI-compatible API", version="1.2.0")
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_bearer(authorization: Optional[str]) -> str:
+    """Extract the raw key from an Authorization header."""
+    if not authorization:
+        return ""
+    parts = authorization.split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return authorization  # accept raw key
 
 
 def _check_auth(authorization: Optional[str]) -> bool:
-    """Validate the Bearer token. Returns True if auth is disabled or the key matches."""
-    if not API_KEY:
-        return True  # auth disabled (no API_KEY configured)
-    if not authorization:
-        return False
-    # Accept "Bearer <key>" (standard OpenAI format)
-    parts = authorization.split(" ", 1)
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1] == API_KEY
-    # Also accept raw key (some clients send it directly)
-    return authorization == API_KEY
+    """Validate the Bearer token.
+
+    A key is valid if it matches:
+    1. The bootstrap key from the API_KEY env var (if set), or
+    2. Any active key in the keystore file.
+    If neither API_KEY nor any keystore key exists, auth is disabled.
+    """
+    raw_key = _extract_bearer(authorization)
+    if not API_KEY and not keystore.list_keys():
+        return True  # auth disabled (no keys configured at all)
+    return keystore.is_valid_key(raw_key, bootstrap_key=API_KEY)
+
+
+def _check_admin(authorization: Optional[str]) -> bool:
+    """Validate the admin token for /admin/* endpoints."""
+    if not ADMIN_KEY:
+        return False  # admin endpoints disabled
+    raw_key = _extract_bearer(authorization)
+    return raw_key == ADMIN_KEY
 
 
 def _unauthorized():
@@ -47,6 +71,29 @@ def _unauthorized():
             "code": "invalid_api_key",
         }},
     )
+
+
+def _forbidden():
+    return JSONResponse(
+        status_code=403,
+        content={"error": {
+            "message": "Admin key required for this endpoint.",
+            "type": "invalid_request_error",
+            "code": "admin_required",
+        }},
+    )
+
+
+def _not_found():
+    return JSONResponse(
+        status_code=404,
+        content={"error": {
+            "message": "Not found.",
+            "type": "invalid_request_error",
+        }},
+    )
+
+
 # Server runs headless and must never pop a visible browser mid-request. With
 # both recovery passes disabled, an expired clearance surfaces immediately as a
 # 503 (see ClearanceRequired handling below) so an operator can re-clear out of
@@ -126,6 +173,11 @@ def _stream(prompt: str, model: str, conversation_id=None):
     yield "data: [DONE]\n\n"
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.get("/v1/models")
 def list_models(authorization: Optional[str] = Header(None)):
     if not _check_auth(authorization):
@@ -177,11 +229,85 @@ def chat_completions(req: ChatCompletionRequest, authorization: Optional[str] = 
     return completion_response(reply.text, model, reply.conversation_id)
 
 
+# ---------------------------------------------------------------------------
+# Admin endpoints — hot key management (no restart required)
+# ---------------------------------------------------------------------------
+
+class CreateKeyRequest(BaseModel):
+    name: str = ""
+
+
+@app.post("/admin/keys")
+def create_key(req: CreateKeyRequest, authorization: Optional[str] = Header(None)):
+    """Generate a new API key. The full key is returned once; it is not retrievable later."""
+    if not _check_admin(authorization):
+        if not ADMIN_KEY:
+            return _not_found()
+        return _forbidden()
+    record = keystore.generate_key(name=req.name)
+    return {
+        "id": record["id"],
+        "key": record["key"],
+        "name": record["name"],
+        "created_at": record["created_at"],
+        "message": "Save this key now — it will not be shown in full again.",
+    }
+
+
+@app.get("/admin/keys")
+def list_keys(authorization: Optional[str] = Header(None)):
+    """List all API keys (masked). Revoked keys are included for audit."""
+    if not _check_admin(authorization):
+        if not ADMIN_KEY:
+            return _not_found()
+        return _forbidden()
+    keys = keystore.list_all_keys()
+    return {
+        "count": len(keys),
+        "keys": [
+            {
+                "id": k["id"],
+                "name": k.get("name", ""),
+                "key": keystore.mask_key(k["key"]),
+                "created_at": k.get("created_at"),
+                "revoked": k.get("revoked", False),
+                "revoked_at": k.get("revoked_at"),
+            }
+            for k in keys
+        ],
+        "bootstrap_key_configured": bool(API_KEY),
+    }
+
+
+@app.delete("/admin/keys/{key_id}")
+def revoke_key(key_id: str, authorization: Optional[str] = Header(None)):
+    """Revoke an API key by its id."""
+    if not _check_admin(authorization):
+        if not ADMIN_KEY:
+            return _not_found()
+        return _forbidden()
+    revoked = keystore.revoke_key(key_id)
+    if not revoked:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": f"Key '{key_id}' not found or already revoked."}},
+        )
+    return {"message": f"Key '{key_id}' revoked successfully.", "id": key_id}
+
+
+# ---------------------------------------------------------------------------
+# Root / health
+# ---------------------------------------------------------------------------
+
+
 @app.get("/")
 def root():
+    has_keys = bool(API_KEY) or bool(keystore.list_keys())
     return {
         "service": "Copilot OpenAI-compatible API",
-        "version": "1.1.0",
-        "auth": "enabled" if API_KEY else "disabled",
+        "version": "1.2.0",
+        "auth": "enabled" if has_keys else "disabled",
         "endpoints": ["/v1/models", "/v1/chat/completions"],
+        "admin": "enabled" if ADMIN_KEY else "disabled",
+        "admin_endpoints": ["/admin/keys"] if ADMIN_KEY else [],
     }

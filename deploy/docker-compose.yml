@@ -15,6 +15,7 @@ services:
       RATE_LIMIT_BURST: "4"
     volumes:
       - ./session:/app/session
+      - ./data:/app/data
     networks:
       - proxy-network
 
