@@ -11,6 +11,8 @@
 - 容器日志中出现 `BrowserType.launch_persistent_context` 或 `Not signed in` 错误
 
 ---
+cd E:\Workspace\Projects\Windows-Copilot-API
+.\venv\Scripts\python.exe -m copilot login
 
 ## 步骤
 

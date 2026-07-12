@@ -7,7 +7,7 @@ venv/
 # All session state: persistent browser profile (cookies, Cloudflare
 # clearance, sign-in) + cached auth token. Secret.
 session/
-
+docs/
 # Local config / secrets
 config.json
 .env
@@ -23,3 +23,4 @@ CLAUDE.md
 
 # Temp archives
 *.tar.gz
+credentials.json
