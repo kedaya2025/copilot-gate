@@ -2,14 +2,15 @@
 
 import threading
 import time
+from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired
 
-from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from .config import API_KEY, MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
 from .openai_format import (
     completion_response,
     new_id,
@@ -20,7 +21,32 @@ from .prompt import messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 
-app = FastAPI(title="Copilot OpenAI-compatible API", version="1.0.0")
+app = FastAPI(title="Copilot OpenAI-compatible API", version="1.1.0")
+
+
+def _check_auth(authorization: Optional[str]) -> bool:
+    """Validate the Bearer token. Returns True if auth is disabled or the key matches."""
+    if not API_KEY:
+        return True  # auth disabled (no API_KEY configured)
+    if not authorization:
+        return False
+    # Accept "Bearer <key>" (standard OpenAI format)
+    parts = authorization.split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1] == API_KEY
+    # Also accept raw key (some clients send it directly)
+    return authorization == API_KEY
+
+
+def _unauthorized():
+    return JSONResponse(
+        status_code=401,
+        content={"error": {
+            "message": "Invalid API key. Set the 'Authorization: Bearer <key>' header.",
+            "type": "invalid_request_error",
+            "code": "invalid_api_key",
+        }},
+    )
 # Server runs headless and must never pop a visible browser mid-request. With
 # both recovery passes disabled, an expired clearance surfaces immediately as a
 # 503 (see ClearanceRequired handling below) so an operator can re-clear out of
@@ -101,7 +127,9 @@ def _stream(prompt: str, model: str, conversation_id=None):
 
 
 @app.get("/v1/models")
-def list_models():
+def list_models(authorization: Optional[str] = Header(None)):
+    if not _check_auth(authorization):
+        return _unauthorized()
     return {
         "object": "list",
         "data": [
@@ -111,7 +139,9 @@ def list_models():
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest):
+def chat_completions(req: ChatCompletionRequest, authorization: Optional[str] = Header(None)):
+    if not _check_auth(authorization):
+        return _unauthorized()
     prompt = messages_to_prompt(req.messages)
     if not prompt.strip():
         return JSONResponse(
@@ -149,4 +179,9 @@ def chat_completions(req: ChatCompletionRequest):
 
 @app.get("/")
 def root():
-    return {"service": "Copilot OpenAI-compatible API", "endpoints": ["/v1/models", "/v1/chat/completions"]}
+    return {
+        "service": "Copilot OpenAI-compatible API",
+        "version": "1.1.0",
+        "auth": "enabled" if API_KEY else "disabled",
+        "endpoints": ["/v1/models", "/v1/chat/completions"],
+    }

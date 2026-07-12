@@ -132,10 +132,31 @@ All configuration is via environment variables or a `.env` file (see [`.env.exam
 | Variable | Default | Description |
 | --- | --- | --- |
 | `COPILOT_URL` | `https://copilot.microsoft.com` | Base URL. Set to `https://m365.cloud.microsoft` for enterprise. |
+| `API_KEY` | *(empty)* | API key for Bearer token auth. Set to `auto` to generate a random key on startup. Leave empty to disable auth. |
 | `HOST` | `127.0.0.1` | Server bind address. Use `0.0.0.0` in Docker. |
 | `PORT` | `8000` | Server port. |
 | `RATE_LIMIT_RPM` | `12` | Max requests per minute. `0` disables limiting. |
 | `RATE_LIMIT_BURST` | `4` | Max back-to-back requests before pacing kicks in. |
+
+### API Key Authentication
+
+When `API_KEY` is set, all `/v1/*` endpoints require an `Authorization: Bearer <key>` header (standard OpenAI format). This prevents unauthorized access if your domain is discovered.
+
+```bash
+# Generate a key
+python -c "import secrets; print(f'sk-copilot-{secrets.token_urlsafe(32)}')"
+
+# Set it in .env
+API_KEY=sk-copilot-your-key-here
+
+# Use it with the OpenAI SDK (the key goes in api_key)
+client = OpenAI(base_url="https://copilot.us.kg/v1", api_key="sk-copilot-your-key-here")
+
+# Or with curl
+curl -H "Authorization: Bearer sk-copilot-your-key-here" https://copilot.us.kg/v1/models
+```
+
+When auth is disabled (empty `API_KEY`), the server accepts all requests — fine for local development, not recommended for production.
 
 ---
 

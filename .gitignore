@@ -17,7 +17,9 @@ deploy/.env
 test.py
 main.py
 CLAUDE.md
-docs/
 
 # Logs
 *.log
+
+# Temp archives
+*.tar.gz

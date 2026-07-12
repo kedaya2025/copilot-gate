@@ -1,9 +1,22 @@
 """Server configuration — shared constants."""
 
 import os
+import secrets
 
 # The single model id this bridge advertises (Copilot has no model selector).
 MODEL_NAME = "copilot"
+
+# API key for authenticating requests. Set via the ``API_KEY`` env var.
+# When set, all /v1/* endpoints require ``Authorization: Bearer <key>``.
+# When empty (default), auth is disabled (backward compatible).
+# If the var is set to "auto", a random key is generated on startup and
+# printed to stderr.
+_api_key_raw = os.environ.get("API_KEY", "")
+if _api_key_raw.lower() == "auto":
+    API_KEY = f"sk-copilot-{secrets.token_urlsafe(32)}"
+    print(f"[copilot] Generated API key: {API_KEY}", flush=True)
+else:
+    API_KEY = _api_key_raw
 
 # Self-imposed rate limit (Copilot publishes none). Tune to whatever ceiling the
 # probe in tests/ratelimit.py shows your account tolerates.
